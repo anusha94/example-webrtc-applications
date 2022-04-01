@@ -1,12 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"runtime"
-	"strings"
-	"time"
 
-	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 
 	gst "github.com/pion/example-webrtc-applications/v3/internal/gstreamer-sink"
@@ -16,9 +14,6 @@ import (
 // gstreamerReceiveMain is launched in a goroutine because the main thread is needed
 // for Glib's main loop (Gstreamer uses Glib)
 func gstreamerReceiveMain() {
-	// Everything below is the pion-WebRTC API! Thanks for using it ❤️.
-
-	// Prepare the configuration
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
@@ -27,50 +22,36 @@ func gstreamerReceiveMain() {
 		},
 	}
 
-	// Create a new RTCPeerConnection
 	peerConnection, err := webrtc.NewPeerConnection(config)
 	if err != nil {
 		panic(err)
 	}
 
-	// Set a handler for when a new remote track starts, this handler creates a gstreamer pipeline
-	// for the given codec
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
-		go func() {
-			ticker := time.NewTicker(time.Second * 3)
-			for range ticker.C {
-				rtcpSendErr := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
-				if rtcpSendErr != nil {
-					fmt.Println(rtcpSendErr)
-				}
-			}
-		}()
+	peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
+		fmt.Println("got ice candidate")
 
-		codecName := strings.Split(track.Codec().RTPCodecCapability.MimeType, "/")[1]
-		fmt.Printf("Track has started, of type %d: %s \n", track.PayloadType(), codecName)
-		pipeline := gst.CreatePipeline(track.PayloadType(), strings.ToLower(codecName))
-		pipeline.Start()
-		buf := make([]byte, 1400)
-		for {
-			i, _, readErr := track.Read(buf)
-			if readErr != nil {
-				panic(err)
-			}
-
-			pipeline.Push(buf[:i])
+		if i != nil {
+			peerConnection.AddICECandidate(i.ToJSON())
 		}
 	})
 
-	// Set the handler for ICE connection state
-	// This will notify you when the peer has connected/disconnected
+	peerConnection.OnDataChannel(func(dc *webrtc.DataChannel) {
+		// fmt.Println(dc.Label())
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			fmt.Println(msg)
+		})
+	})
+
 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		fmt.Printf("Connection State has changed %s \n", connectionState.String())
 	})
 
-	// Wait for the offer to be pasted
 	offer := webrtc.SessionDescription{}
-	signal.Decode(signal.MustReadStdin(), &offer)
+
+	err = json.Unmarshal([]byte(signal.MustReadStdin()), &offer)
+	if err != nil {
+		panic(err)
+	}
 
 	// Set the remote SessionDescription
 	err = peerConnection.SetRemoteDescription(offer)
@@ -78,28 +59,29 @@ func gstreamerReceiveMain() {
 		panic(err)
 	}
 
-	// Create an answer
 	answer, err := peerConnection.CreateAnswer(nil)
 	if err != nil {
 		panic(err)
 	}
 
-	// Create channel that is blocked until ICE Gathering is complete
-	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
-
-	// Sets the LocalDescription, and starts our UDP listeners
 	err = peerConnection.SetLocalDescription(answer)
 	if err != nil {
 		panic(err)
 	}
 
+	a, err := json.Marshal(answer)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(a))
+
+	// Create channel that is blocked until ICE Gathering is complete
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+
 	// Block until ICE Gathering is complete, disabling trickle ICE
 	// we do this because we only can exchange one signaling message
 	// in a production application you should exchange ICE Candidates via OnICECandidate
 	<-gatherComplete
-
-	// Output the answer in base64 so we can paste it in browser
-	fmt.Println(signal.Encode(*peerConnection.LocalDescription()))
 
 	// Block forever
 	select {}
